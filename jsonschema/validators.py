@@ -1,20 +1,20 @@
 from __future__ import division
 
-from warnings import warn
 import contextlib
 import json
 import numbers
 
-from six import add_metaclass
+try:
+    import requests
+except ImportError:
+    requests = None
 
-from jsonschema import _utils, _validators, _types
+from jsonschema import _utils, _validators
 from jsonschema.compat import (
     Sequence, urljoin, urlsplit, urldefrag, unquote, urlopen,
     str_types, int_types, iteritems, lru_cache,
 )
-from jsonschema.exceptions import (
-    RefResolutionError, SchemaError, UnknownType, UndefinedTypeCheck
-)
+from jsonschema.exceptions import RefResolutionError, SchemaError, UnknownType
 
 # Sigh. https://gitlab.com/pycqa/flake8/issues/280
 #       https://github.com/pyga/ebb-lint/issues/7
@@ -56,171 +56,24 @@ def validates(version):
     return _validates
 
 
-def _generate_legacy_type_checks(types=()):
-    """
-    Generate type check definitions suitable for TypeChecker.redefine_many,
-    using the supplied types. Type Checks are simple isinstance checks,
-    except checking that numbers aren't really bools.
-
-    Arguments:
-
-        types (dict):
-
-            A mapping of type names to their Python Types
-
-    Returns:
-
-        A dictionary of definitions to pass to TypeChecker
-
-    """
-    types = dict(types)
-
-    def gen_type_check(pytypes):
-        pytypes = _utils.flatten(pytypes)
-
-        def type_check(checker, instance):
-            if isinstance(instance, bool):
-                if bool not in pytypes:
-                    return False
-            return isinstance(instance, pytypes)
-
-        return type_check
-
-    definitions = {}
-    for typename, pytypes in iteritems(types):
-        definitions[typename] = gen_type_check(pytypes)
-
-    return definitions
-
-
-class _DefaultTypesDeprecatingMetaClass(type):
-    @property
-    def DEFAULT_TYPES(self):
-        warn(
-            (
-                "The DEFAULT_TYPES attribute is deprecated. "
-                "See the type checker attached to this validator instead."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._DEFAULT_TYPES
-
-
-def create(
-    meta_schema,
-    validators=(),
-    version=None,
-    default_types=None,
-    type_checker=None,
-):
-    """
-    Create a new validator class.
-
-    Arguments:
-
-        meta_schema (collections.Mapping):
-
-            the meta schema for the new validator class
-
-        validators (collections.Mapping):
-
-            a mapping from names to callables, where each callable will
-            validate the schema property with the given name.
-
-            Each callable should take 4 arguments:
-
-                1. a validator instance,
-                2. the value of the property being validated within the
-                   instance
-                3. the instance
-                4. the schema
-
-        version (str):
-
-            an identifier for the version that this validator class will
-            validate. If provided, the returned validator class will have its
-            ``__name__`` set to include the version, and also will have
-            `jsonschema.validators.validates` automatically called for the
-            given version.
-
-        type_checker (jsonschema.TypeChecker):
-
-            a type checker, used when applying the :validator:`type` validator.
-
-            If unprovided, an empty `jsonschema.TypeChecker` will created with
-            no known default types.
-
-        default_types (collections.Mapping):
-
-            .. deprecated:: 2.7.0
-
-                Please use the type_checker argument instead.
-
-            If set, it provides mappings of JSON types to Python types that
-            will be converted to functions and redefined in this object's
-            `jsonschema.TypeChecker`.
-
-    Returns:
-
-        a new `jsonschema.IValidator` class
-    """
-
-    if default_types is not None:
-        if type_checker is not None:
-            raise TypeError(
-                "Do not specify default_types when providing a type checker.",
-            )
-        warn(
-            (
-                "The default_types argument is deprecated. "
-                "Use the type_checker argument instead."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        type_checker = _types.TypeChecker(
-            type_checkers=_generate_legacy_type_checks(default_types),
-        )
-    else:
+def create(meta_schema, validators=(), version=None, default_types=None):
+    if default_types is None:
         default_types = {
             u"array": list, u"boolean": bool, u"integer": int_types,
             u"null": type(None), u"number": numbers.Number, u"object": dict,
             u"string": str_types,
         }
-        if type_checker is None:
-            type_checker = _types.TypeChecker()
 
-    @add_metaclass(_DefaultTypesDeprecatingMetaClass)
     class Validator(object):
-
         VALIDATORS = dict(validators)
         META_SCHEMA = dict(meta_schema)
-        TYPE_CHECKER = type_checker
-
-        _DEFAULT_TYPES = dict(default_types)
+        DEFAULT_TYPES = dict(default_types)
 
         def __init__(
-            self,
-            schema,
-            types=(),
-            resolver=None,
-            format_checker=None,
+            self, schema, types=(), resolver=None, format_checker=None,
         ):
-            if types:
-                warn(
-                    (
-                        "The types argument is deprecated. Provide "
-                        "a type_checker to jsonschema.validators.extend "
-                        "instead."
-                    ),
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
-                self.TYPE_CHECKER = self.TYPE_CHECKER.redefine_many(
-                    _generate_legacy_type_checks(types),
-                )
+            self._types = dict(self.DEFAULT_TYPES)
+            self._types.update(types)
 
             if resolver is None:
                 resolver = RefResolver.from_schema(schema)
@@ -282,10 +135,19 @@ def create(
                 raise error
 
         def is_type(self, instance, type):
-            try:
-                return self.TYPE_CHECKER.is_type(instance, type)
-            except UndefinedTypeCheck:
+            if type not in self._types:
                 raise UnknownType(type, instance, self.schema)
+            pytypes = self._types[type]
+
+            # bool inherits from int, so ensure bools aren't reported as ints
+            if isinstance(instance, bool):
+                pytypes = _utils.flatten(pytypes)
+                is_number = any(
+                    issubclass(pytype, numbers.Number) for pytype in pytypes
+                )
+                if is_number and bool not in pytypes:
+                    return False
+            return isinstance(instance, pytypes)
 
         def is_valid(self, instance, _schema=None):
             error = next(self.iter_errors(instance, _schema), None)
@@ -298,77 +160,15 @@ def create(
     return Validator
 
 
-def extend(validator, validators=(), version=None, type_checker=None):
-    """
-    Create a new validator class by extending an existing one.
-
-    Arguments:
-
-        validator (jsonschema.IValidator):
-
-            an existing validator class
-
-        validators (collections.Mapping):
-
-            a mapping of new validator callables to extend with, whose
-            structure is as in `create`.
-
-            .. note::
-
-                Any validator callables with the same name as an existing one
-                will (silently) replace the old validator callable entirely,
-                effectively overriding any validation done in the "parent"
-                validator class.
-
-                If you wish to instead extend the behavior of a parent's
-                validator callable, delegate and call it directly in the new
-                validator function by retrieving it using
-                ``OldValidator.VALIDATORS["validator_name"]``.
-
-        version (str):
-
-            a version for the new validator class
-
-        type_checker (jsonschema.TypeChecker):
-
-            a type checker, used when applying the :validator:`type` validator.
-
-            If unprovided, the type checker of the extended
-            `jsonschema.IValidator` will be carried along.`
-
-    Returns:
-
-        a new `jsonschema.IValidator` class extending the one provided
-
-    .. note:: Meta Schemas
-
-        The new validator class will have its parent's meta schema.
-
-        If you wish to change or extend the meta schema in the new
-        validator class, modify ``META_SCHEMA`` directly on the returned
-        class. Note that no implicit copying is done, so a copy should
-        likely be made before modifying it, in order to not affect the
-        old validator.
-    """
-
+def extend(validator, validators, version=None):
     all_validators = dict(validator.VALIDATORS)
     all_validators.update(validators)
-
-    if not type_checker:
-        type_checker = validator.TYPE_CHECKER
-
-    # Set the default_types to None during class creation to avoid
-    # overwriting the type checker (and triggering the deprecation warning).
-    # Then set them directly
-    new_validator_cls = create(
+    return create(
         meta_schema=validator.META_SCHEMA,
         validators=all_validators,
         version=version,
-        default_types=None,
-        type_checker=type_checker
+        default_types=validator.DEFAULT_TYPES,
     )
-    new_validator_cls._DEFAULT_TYPES = validator._DEFAULT_TYPES
-    return new_validator_cls
 
 
 Draft3Validator = create(
@@ -397,7 +197,6 @@ Draft3Validator = create(
         u"type": _validators.type_draft3,
         u"uniqueItems": _validators.uniqueItems,
     },
-    type_checker=_types.draft3_type_checker,
     version="draft3",
 )
 
@@ -431,7 +230,6 @@ Draft4Validator = create(
         u"type": _validators.type_draft4,
         u"uniqueItems": _validators.uniqueItems,
     },
-    type_checker=_types.draft4_type_checker,
     version="draft4",
 )
 
@@ -473,12 +271,6 @@ class RefResolver(object):
             A cache that will be used for caching the results of
             resolved remote URLs.
 
-    Attributes:
-
-        cache_remote (bool):
-
-            Whether remote refs should be cached after first resolution
-
     """
 
     def __init__(
@@ -507,6 +299,7 @@ class RefResolver(object):
         )
         self.store.update(store)
         self.store[base_uri] = referrer
+        self.subschema_store = self.extract_store_subschemas()
 
         self._urljoin_cache = urljoin_cache
         self._remote_cache = remote_cache
@@ -524,11 +317,19 @@ class RefResolver(object):
 
         Returns:
 
-            `RefResolver`
+            :class:`RefResolver`
 
         """
 
         return cls(schema.get(u"id", u""), schema, *args, **kwargs)
+
+    def extract_store_subschemas(self):
+        subschemas = dict()
+        for base_id, schema in self.store.items():
+            subschemas[base_id] = {
+                subschema[u"id"].lstrip(u'#'): subschema for subschema in _utils.subschemas(schema)
+            }
+        return subschemas
 
     def push_scope(self, scope):
         self._scopes_stack.append(
@@ -607,13 +408,19 @@ class RefResolver(object):
 
             document:
 
-                The referent document
+                The referrant document
 
             fragment (str):
 
                 a URI fragment to resolve within it
 
         """
+
+        # First try looking up the fragment schema reference in the subschema_store.
+        try:
+            return self.subschema_store[document[u'id']][fragment]
+        except (KeyError, LookupError, TypeError):
+            pass
 
         fragment = fragment.lstrip(u"/")
         parts = unquote(fragment).split(u"/") if fragment else []
@@ -666,10 +473,6 @@ class RefResolver(object):
         .. _requests: http://pypi.python.org/pypi/requests/
 
         """
-        try:
-            import requests
-        except ImportError:
-            requests = None
 
         scheme = urlsplit(uri).scheme
 
@@ -692,30 +495,13 @@ class RefResolver(object):
 
         if self.cache_remote:
             self.store[uri] = result
+            self.subschema_store[uri] = {
+                subschema[u"id"].lstrip(u'#'): subschema for subschema in _utils.subschemas(result)
+            }
         return result
 
 
 def validator_for(schema, default=_unset):
-    """
-    Retrieve the validator class appropriate for validating the given schema.
-
-    Uses the :validator:`$schema` property that should be present in the given
-    schema to look up the appropriate validator class.
-
-    Arguments:
-
-        schema (dict):
-
-            the schema to look at
-
-        default:
-
-            the default to return if the appropriate validator class cannot be
-            determined.
-
-            If unprovided, the default is to return
-            `jsonschema.Draft4Validator`.
-    """
     if default is _unset:
         default = Draft4Validator
     return meta_schemas.get(schema.get(u"$schema", u""), default)
@@ -734,8 +520,8 @@ def validate(instance, schema, cls=None, *args, **kwargs):
     valid, since not doing so can lead to less obvious error messages and fail
     in less obvious or consistent ways. If you know you have a valid schema
     already or don't care, you might prefer using the
-    `IValidator.validate` method directly on a specific validator
-    (e.g. ``Draft4Validator.validate``).
+    :meth:`~IValidator.validate` method directly on a specific validator
+    (e.g. :meth:`Draft4Validator.validate`).
 
 
     Arguments:
@@ -748,7 +534,7 @@ def validate(instance, schema, cls=None, *args, **kwargs):
 
             The schema to validate with
 
-        cls (IValidator):
+        cls (:class:`IValidator`):
 
             The class that will be used to validate the instance.
 
@@ -758,22 +544,19 @@ def validate(instance, schema, cls=None, *args, **kwargs):
     proper validator will be used.  The specification recommends that all
     schemas contain :validator:`$schema` properties for this reason. If no
     :validator:`$schema` property is found, the default validator class is
-    `Draft4Validator`.
+    :class:`Draft4Validator`.
 
     Any other provided positional and keyword arguments will be passed on when
     instantiating the ``cls``.
 
     Raises:
 
-        `jsonschema.exceptions.ValidationError` if the instance
-            is invalid
+        :exc:`ValidationError` if the instance is invalid
 
-        `jsonschema.exceptions.SchemaError` if the schema itself
-            is invalid
+        :exc:`SchemaError` if the schema itself is invalid
 
     .. rubric:: Footnotes
-    .. [#] known by a validator registered with
-        `jsonschema.validators.validates`
+    .. [#] known by a validator registered with :func:`validates`
     """
     if cls is None:
         cls = validator_for(schema)
